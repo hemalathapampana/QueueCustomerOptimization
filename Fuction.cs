@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Data;
 using Microsoft.Data.SqlClient;
 using System.Linq;
@@ -515,6 +515,10 @@ namespace Altaworx.SimCard.Cost.QueueCustomerOptimization
                 optimizationSimCards = optimizationSimCards.Where(s => !string.IsNullOrWhiteSpace(s.CustomerRatePlanCode)).ToList();
             }
 
+            // Record device count before any optimization-specific preprocessing
+            var deviceCountBeforeOptimization = optimizationSimCards.Count;
+            LogInfo(context, LogTypeConstant.Info, $"Device count before optimization: {deviceCountBeforeOptimization}");
+
             // process Pooled by Customer Rate Pool
             var ratePlansByCustomerRatePool = ratePlans.Where(ratePlan => !ratePlan.AutoChangeRatePlan).ToList();
             if (ratePlansByCustomerRatePool.Any())
@@ -529,6 +533,10 @@ namespace Altaworx.SimCard.Cost.QueueCustomerOptimization
                     optimizationSimCards = ProcessDevicesWithAutoChangeDisabledRatePlans(context, integrationAuthenticationId, usesProration, revAccountNumber, AMOPCustomerId, billingPeriod, nextBillingPeriod, instanceId, optimizationSimCards, ratePlansByCustomerRatePool, tenantId);
                 }
             }
+
+            // Record device count after preprocessing, i.e., devices that will enter the optimization algorithm
+            var deviceCountAfterPreprocessing = optimizationSimCards.Count;
+            LogInfo(context, LogTypeConstant.Info, $"Device count after preprocessing (ready for optimization): {deviceCountAfterPreprocessing}");
 
             var simCardsByRatePoolIds = optimizationSimCards.GroupBy(x => x.CustomerRatePoolId).Distinct();
 
@@ -782,6 +790,10 @@ namespace Altaworx.SimCard.Cost.QueueCustomerOptimization
 
             optimizationSimCards = optimizationSimCards.Where(s => !string.IsNullOrWhiteSpace(s.CustomerRatePlanCode)).ToList();
 
+            // Record device count before any optimization-specific preprocessing (cross-provider)
+            var deviceCountBeforeOptimization = optimizationSimCards.Count;
+            LogInfo(context, LogTypeConstant.Info, $"Device count before optimization: {deviceCountBeforeOptimization}");
+
             // Process Pooled by Customer Rate Pool
             var ratePlansByCustomerRatePool = ratePlans.Where(ratePlan => !ratePlan.AutoChangeRatePlan).ToList();
             if (ratePlansByCustomerRatePool.Any())
@@ -797,6 +809,10 @@ namespace Altaworx.SimCard.Cost.QueueCustomerOptimization
                     // checked
                 }
             }
+
+            // Record device count after preprocessing, i.e., devices that will enter the optimization algorithm (cross-provider)
+            var deviceCountAfterPreprocessing = optimizationSimCards.Count;
+            LogInfo(context, LogTypeConstant.Info, $"Device count after preprocessing (ready for optimization): {deviceCountAfterPreprocessing}");
 
             var autoChangeRatePlans = ratePlans.Where(ratePlan => ratePlan.AutoChangeRatePlan);
             if (autoChangeRatePlans.Any() && !string.IsNullOrWhiteSpace(serviceProviderIds))
