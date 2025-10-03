@@ -509,7 +509,13 @@ namespace Altaworx.SimCard.Cost.QueueCustomerOptimization
 
         private async Task<bool> ProcessDevicesByCustomerRatePlans(KeySysLambdaContext context, int? integrationAuthenticationId, bool usesProration, string revAccountNumber, int? AMOPCustomerId, List<RatePlan> ratePlans, BillingPeriod billingPeriod, BillingPeriod nextBillingPeriod, long instanceId, OptimizationChargeType chargeType, SiteTypes customerType, int tenantId)
         {
-            var optimizationSimCards = GetOptimizationSimCards(context, null, billingPeriod.ServiceProviderId, revAccountNumber, integrationAuthenticationId, billingPeriod.Id, tenantId, customerType, AMOPCustomerId);
+            var allSimCards = GetOptimizationSimCards(context, null, billingPeriod.ServiceProviderId, revAccountNumber, integrationAuthenticationId, billingPeriod.Id, tenantId, customerType, AMOPCustomerId);
+            var totalFetched = allSimCards.Count;
+            var withPlanCode = allSimCards.Count(s => !string.IsNullOrWhiteSpace(s.CustomerRatePlanCode));
+            var withoutPlanCode = totalFetched - withPlanCode;
+            LogInfo(context, LogTypeConstant.Info, $"Fetched SIMs: total={totalFetched}, withPlanCode={withPlanCode}, withoutPlanCode={withoutPlanCode}");
+
+            var optimizationSimCards = allSimCards;
             if (revAccountNumber != null || AMOPCustomerId != null)
             {
                 optimizationSimCards = optimizationSimCards.Where(s => !string.IsNullOrWhiteSpace(s.CustomerRatePlanCode)).ToList();
@@ -518,9 +524,16 @@ namespace Altaworx.SimCard.Cost.QueueCustomerOptimization
             // Record device count before any optimization-specific preprocessing
             var deviceCountBeforeOptimization = optimizationSimCards.Count;
             LogInfo(context, LogTypeConstant.Info, $"Device count before optimization: {deviceCountBeforeOptimization}");
+            // How many devices have plan codes that are not part of the candidate ratePlans set
+            var candidatePlanNames = ratePlans.Select(r => r.PlanName).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var planCodeNotInCandidates = optimizationSimCards.Count(x => !string.IsNullOrWhiteSpace(x.CustomerRatePlanCode) && !candidatePlanNames.Contains(x.CustomerRatePlanCode));
+            LogInfo(context, LogTypeConstant.Info, $"Devices with plan code not in candidate ratePlans: {planCodeNotInCandidates}");
 
             // process Pooled by Customer Rate Pool
             var ratePlansByCustomerRatePool = ratePlans.Where(ratePlan => !ratePlan.AutoChangeRatePlan).ToList();
+            var disabledPlanNames = ratePlansByCustomerRatePool.Select(r => r.PlanName).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var disabledPlanDeviceCandidates = optimizationSimCards.Count(x => !string.IsNullOrWhiteSpace(x.CustomerRatePlanCode) && disabledPlanNames.Contains(x.CustomerRatePlanCode));
+            LogInfo(context, LogTypeConstant.Info, $"Devices with AutoChangeRatePlan disabled: {disabledPlanDeviceCandidates}");
             if (ratePlansByCustomerRatePool.Any())
             {
                 if (CheckZeroValueRatePlans(context, instanceId, ratePlansByCustomerRatePool, shouldStopInstance: true))
@@ -530,13 +543,24 @@ namespace Altaworx.SimCard.Cost.QueueCustomerOptimization
                 else
                 {
                     // process and return the remaining devices for optimization with algorithm
+                    var beforeDisabledFlowCount = optimizationSimCards.Count;
                     optimizationSimCards = ProcessDevicesWithAutoChangeDisabledRatePlans(context, integrationAuthenticationId, usesProration, revAccountNumber, AMOPCustomerId, billingPeriod, nextBillingPeriod, instanceId, optimizationSimCards, ratePlansByCustomerRatePool, tenantId);
+                    var removedByDisabledFlow = beforeDisabledFlowCount - optimizationSimCards.Count;
+                    LogInfo(context, LogTypeConstant.Info, $"Devices handled by 'AutoChange disabled' flow: {removedByDisabledFlow}");
                 }
             }
 
             // Record device count after preprocessing, i.e., devices that will enter the optimization algorithm
             var deviceCountAfterPreprocessing = optimizationSimCards.Count;
             LogInfo(context, LogTypeConstant.Info, $"Device count after preprocessing (ready for optimization): {deviceCountAfterPreprocessing}");
+
+            // Breakdown of remaining devices by pool/null and auto-change plan membership
+            var nullPoolCount = optimizationSimCards.Count(x => x.CustomerRatePoolId == null);
+            var nonNullPoolCount = deviceCountAfterPreprocessing - nullPoolCount;
+            LogInfo(context, LogTypeConstant.Info, $"Remaining devices by pool: nonNullPool={nonNullPoolCount}, nullPool={nullPoolCount}");
+            var autoChangePlanNames = ratePlans.Where(r => r.AutoChangeRatePlan).Select(r => r.PlanName).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var autoPlanCandidates = optimizationSimCards.Count(x => !string.IsNullOrWhiteSpace(x.CustomerRatePlanCode) && autoChangePlanNames.Contains(x.CustomerRatePlanCode));
+            LogInfo(context, LogTypeConstant.Info, $"Remaining devices matching auto-change plan codes: {autoPlanCandidates}");
 
             var simCardsByRatePoolIds = optimizationSimCards.GroupBy(x => x.CustomerRatePoolId).Distinct();
 
@@ -786,16 +810,27 @@ namespace Altaworx.SimCard.Cost.QueueCustomerOptimization
         private async Task<bool> ProcessCrossProviderDevicesByCustomerRatePlans(KeySysLambdaContext context, string serviceProviderIds, bool usesProration, List<RatePlan> ratePlans, BillingPeriod billingPeriod, BillingPeriod nextBillingPeriod, long instanceId, OptimizationChargeType chargeType, OptimizationCustomer customer, int tenantId)
         {
             ArgumentNullException.ThrowIfNull(customer);
-            var optimizationSimCards = crossProviderOptimizationRepository.GetCrossProviderCustomerSimCards(ParameterizedLog(context), customer.CustomerType, customer.CustomerId, customer.RevAccountNumber, customer.IntegrationAuthenticationId, billingPeriod, serviceProviderIds);
+            var allSimCards = crossProviderOptimizationRepository.GetCrossProviderCustomerSimCards(ParameterizedLog(context), customer.CustomerType, customer.CustomerId, customer.RevAccountNumber, customer.IntegrationAuthenticationId, billingPeriod, serviceProviderIds);
+            var totalFetched = allSimCards.Count;
+            var withPlanCode = allSimCards.Count(s => !string.IsNullOrWhiteSpace(s.CustomerRatePlanCode));
+            var withoutPlanCode = totalFetched - withPlanCode;
+            LogInfo(context, LogTypeConstant.Info, $"Fetched SIMs: total={totalFetched}, withPlanCode={withPlanCode}, withoutPlanCode={withoutPlanCode}");
 
-            optimizationSimCards = optimizationSimCards.Where(s => !string.IsNullOrWhiteSpace(s.CustomerRatePlanCode)).ToList();
+            var optimizationSimCards = allSimCards.Where(s => !string.IsNullOrWhiteSpace(s.CustomerRatePlanCode)).ToList();
 
             // Record device count before any optimization-specific preprocessing (cross-provider)
             var deviceCountBeforeOptimization = optimizationSimCards.Count;
             LogInfo(context, LogTypeConstant.Info, $"Device count before optimization: {deviceCountBeforeOptimization}");
+            // How many devices have plan codes that are not part of the candidate ratePlans set (provider-scoped)
+            var candidatePlanNames = ratePlans.Select(r => r.PlanName).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var planCodeNotInCandidates = optimizationSimCards.Count(x => !string.IsNullOrWhiteSpace(x.CustomerRatePlanCode) && !candidatePlanNames.Contains(x.CustomerRatePlanCode));
+            LogInfo(context, LogTypeConstant.Info, $"Devices with plan code not in candidate ratePlans: {planCodeNotInCandidates}");
 
             // Process Pooled by Customer Rate Pool
             var ratePlansByCustomerRatePool = ratePlans.Where(ratePlan => !ratePlan.AutoChangeRatePlan).ToList();
+            var disabledPlanNames = ratePlansByCustomerRatePool.Select(r => r.PlanName).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var disabledPlanDeviceCandidates = optimizationSimCards.Count(x => !string.IsNullOrWhiteSpace(x.CustomerRatePlanCode) && disabledPlanNames.Contains(x.CustomerRatePlanCode));
+            LogInfo(context, LogTypeConstant.Info, $"Devices with AutoChangeRatePlan disabled: {disabledPlanDeviceCandidates}");
             if (ratePlansByCustomerRatePool.Any())
             {
                 if (CheckZeroValueRatePlans(context, instanceId, ratePlansByCustomerRatePool, shouldStopInstance: true))
@@ -805,7 +840,10 @@ namespace Altaworx.SimCard.Cost.QueueCustomerOptimization
                 else
                 {
                     // process and return the remaining devices for optimization with algorithm
+                    var beforeDisabledFlowCount = optimizationSimCards.Count;
                     optimizationSimCards = ProcessDevicesWithAutoChangeDisabledRatePlans(context, customer.IntegrationAuthenticationId, usesProration, customer.RevAccountNumber, customer.CustomerId, billingPeriod, nextBillingPeriod, instanceId, optimizationSimCards, ratePlansByCustomerRatePool, tenantId, serviceProviderIds);
+                    var removedByDisabledFlow = beforeDisabledFlowCount - optimizationSimCards.Count;
+                    LogInfo(context, LogTypeConstant.Info, $"Devices handled by 'AutoChange disabled' flow: {removedByDisabledFlow}");
                     // checked
                 }
             }
@@ -813,6 +851,22 @@ namespace Altaworx.SimCard.Cost.QueueCustomerOptimization
             // Record device count after preprocessing, i.e., devices that will enter the optimization algorithm (cross-provider)
             var deviceCountAfterPreprocessing = optimizationSimCards.Count;
             LogInfo(context, LogTypeConstant.Info, $"Device count after preprocessing (ready for optimization): {deviceCountAfterPreprocessing}");
+
+            // Breakdown of remaining devices by pool/null and auto-change plan membership (with provider scoping)
+            var nullPoolCount = optimizationSimCards.Count(x => x.CustomerRatePoolId == null);
+            var nonNullPoolCount = deviceCountAfterPreprocessing - nullPoolCount;
+            LogInfo(context, LogTypeConstant.Info, $"Remaining devices by pool: nonNullPool={nonNullPoolCount}, nullPool={nullPoolCount}");
+            var autoChangePlanNames = ratePlans.Where(r => r.AutoChangeRatePlan).Select(r => r.PlanName).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            if (!string.IsNullOrWhiteSpace(serviceProviderIds))
+            {
+                var serviceProviderIdList = serviceProviderIds.Split(CommonConstants.STRING_ITEMS_SEPERATOR).ToList();
+                autoChangePlanNames = ratePlans
+                    .Where(r => r.AutoChangeRatePlan && r.ServiceProviderIds.Split(CommonConstants.STRING_ITEMS_SEPERATOR).ToList().ContainsAllItems(serviceProviderIdList))
+                    .Select(r => r.PlanName)
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            }
+            var autoPlanCandidates = optimizationSimCards.Count(x => !string.IsNullOrWhiteSpace(x.CustomerRatePlanCode) && autoChangePlanNames.Contains(x.CustomerRatePlanCode));
+            LogInfo(context, LogTypeConstant.Info, $"Remaining devices matching auto-change plan codes (provider-scoped): {autoPlanCandidates}");
 
             var autoChangeRatePlans = ratePlans.Where(ratePlan => ratePlan.AutoChangeRatePlan);
             if (autoChangeRatePlans.Any() && !string.IsNullOrWhiteSpace(serviceProviderIds))
