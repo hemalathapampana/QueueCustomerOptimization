@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Data;
 using Microsoft.Data.SqlClient;
 using System.Linq;
@@ -625,6 +625,8 @@ namespace Altaworx.SimCard.Cost.QueueCustomerOptimization
         {
             LogInfo(context, LogTypeConstant.Sub, detail: $"Start GenerateRatePoolSequences for {ratePoolCollection.RatePools.Count} Rate Plans");
             var ratePoolSequences = RatePoolAssigner.GenerateRatePoolSequences(ratePoolCollection.RatePools);
+            var permutationCount = ratePoolSequences?.Count() ?? 0;
+            LogInfo(context, LogTypeConstant.Info, $"Generated {permutationCount} rate plan permutations for CommPlanGroupId {commPlanGroupId}.");
             LogInfo(context, LogTypeConstant.Sub, "End GenerateRatePoolSequences");
 
             var dtQueueRatePlan = new DataTable();
