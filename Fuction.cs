@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Data;
 using Microsoft.Data.SqlClient;
 using System.Linq;
@@ -586,6 +586,38 @@ namespace Altaworx.SimCard.Cost.QueueCustomerOptimization
                     LogInfo(context, LogTypeConstant.Info, $"No more device to optimize for rate plan in group with rate plan code '{planNameGroup.Key}', AllowsSimPooling: {ratePlanGroup.Key}.");
                     continue;
                 }
+
+                // -----------------------------
+                // AUTO CHANGE RATE PLAN FLOW
+                // -----------------------------
+                // When enabled, we evaluate multiple deterministic strategies and apply the
+                // minimal-cost assignment (device-level) instead of running permutation optimizer.
+                if (context.OptimizationSettings.ShouldPoolAcrossRatePlans)
+                {
+                    LogInfo(context, LogTypeConstant.Info,
+                        $"[AUTO] Auto Change Rate Plan triggered for PlanNameGroup={planNameGroup.Key}, AllowsSimPooling={ratePlanGroup.Key}");
+
+                    var isAutoError = AutoChangeRatePlan(
+                        context,
+                        integrationAuthenticationId,
+                        usesProration,
+                        revAccountNumber,
+                        AMOPCustomerId,
+                        billingPeriod,
+                        instanceId,
+                        chargeType,
+                        planNameGroup,
+                        optimizationSimCards);
+
+                    if (isAutoError)
+                    {
+                        return true;
+                    }
+
+                    // Auto flow handles persistence; skip the permutation optimizer.
+                    continue;
+                }
+
                 // create new comm plan group
                 var commPlanGroupId = CreateCommPlanGroup(context, instanceId);
                 var calculatedPlans = RatePoolCalculator.CalculateMaxAvgUsage(groupRatePlans, null);
@@ -619,6 +651,95 @@ namespace Altaworx.SimCard.Cost.QueueCustomerOptimization
                 }
             }
             return false;
+        }
+
+        /// <summary>
+        /// New AUTO implementation (per user flow):
+        ///
+        /// ProcessPlanNameGroup
+        ///   └── Check Tenant Auto Flag
+        ///      └── AutoChangeRatePlan
+        ///           ├── BuildRatePlanUsage (Avg Usage + Allocated MB)
+        ///           ├── Validation (Allocated > Usage)
+        ///           ├── Assignment Strategy
+        ///           │    ├── Smallest → Largest
+        ///           │    ├── Largest → Smallest
+        ///           │    ├── Comm + Smallest → Largest
+        ///           │    └── Comm + Largest → Smallest
+        ///           └── Apply Assignment + Record Total Cost
+        /// </summary>
+        private bool AutoChangeRatePlan(
+            KeySysLambdaContext context,
+            int? integrationAuthenticationId,
+            bool usesProration,
+            string revAccountNumber,
+            int? AMOPCustomerId,
+            BillingPeriod billingPeriod,
+            long instanceId,
+            OptimizationChargeType chargeType,
+            IGrouping<string, RatePlan> planNameGroup,
+            List<vwOptimizationSimCard> optimizationSimCards)
+        {
+            var groupRatePlans = planNameGroup.ToList();
+
+            // Create comm plan group + queue for this auto run
+            var commPlanGroupId = CreateCommPlanGroup(context, instanceId);
+            AddCustomerRatePlansToCommPlanGroup(context, instanceId, commPlanGroupId, groupRatePlans);
+
+            var queueId = CreateQueue(context, instanceId, commPlanGroupId, billingPeriod.ServiceProviderId, usesProration);
+            StartQueue(context, queueId, $"[AUTO] Best strategy selection for PlanNameGroup={planNameGroup.Key}");
+
+            try
+            {
+                // Evaluate 4 strategies and pick best (minimal total cost)
+                var s1 = AutoRatePlanHelper.EvaluateSmallestToLargest(groupRatePlans, optimizationSimCards, chargeType);
+                var s2 = AutoRatePlanHelper.EvaluateLargestToSmallest(groupRatePlans, optimizationSimCards, chargeType);
+                var s3 = AutoRatePlanHelper.EvaluateCommSmallestToLargest(groupRatePlans, optimizationSimCards, chargeType);
+                var s4 = AutoRatePlanHelper.EvaluateCommLargestToSmallest(groupRatePlans, optimizationSimCards, chargeType);
+
+                var best = new[] { s1, s2, s3, s4 }.OrderBy(x => x.TotalCost).First();
+
+                foreach (var r in new[] { s1, s2, s3, s4 }.OrderBy(x => x.TotalCost))
+                {
+                    LogInfo(context, LogTypeConstant.Info,
+                        $"[AUTO] Strategy={r.Strategy}, TotalCost={r.TotalCost}, UsedMB={r.UsedWithinAllocationMBTotal}, UnusedMB={r.UnusedMBTotal}, ExcessMB={r.ExcessMBTotal}");
+                }
+
+                LogInfo(context, LogTypeConstant.Info,
+                    $"[AUTO] SelectedStrategy={best.Strategy}, TotalCost={best.TotalCost}, UsedMB={best.UsedWithinAllocationMBTotal}, UnusedMB={best.UnusedMBTotal}, ExcessMB={best.ExcessMBTotal}");
+
+                // Apply the chosen device assignments back onto the sim cards (reflection-based)
+                AutoRatePlanHelper.ApplyAssignmentsToSimCards(best, groupRatePlans);
+
+                // Persist results for this queue
+                var simsProjected = ProjectDataUsageAndSaveDevices(context, instanceId, optimizationSimCards, billingPeriod, false);
+                OptimizationResultDbWriter.RecordRatePool(context, context.ConnectionString, queueId, billingPeriod.Id, simsProjected);
+                OptimizationResultDbWriter.RecordTotalCost(context, context.ConnectionString, queueId, best.TotalCost);
+
+                // Log a sample of device assignments (to avoid huge logs)
+                foreach (var a in best.Assignments.Take(50))
+                {
+                    LogInfo(
+                        context,
+                        LogTypeConstant.Info,
+                        $"[AUTO] Sim={a.SimKey}, Comm={a.CommunicationPlan}, UsageMB={a.UsageMB}, AssignedPlanId={a.AssignedRatePlanId}, " +
+                        $"AllocatedMB={a.AllocatedPlanMB}, Base={a.BaseCharge}, Overage={a.OverageCharge}, Total={a.TotalCharge}");
+                }
+
+                if (best.Assignments.Count > 50)
+                {
+                    LogInfo(context, LogTypeConstant.Info, $"[AUTO] Logged 50/{best.Assignments.Count} device assignments (sample).");
+                }
+
+                StopQueue(context, queueId);
+                return false;
+            }
+            catch (Exception ex)
+            {
+                LogInfo(context, LogTypeConstant.Exception, $"[AUTO] AutoChangeRatePlan failed for PlanNameGroup={planNameGroup.Key}. {ex.Message}");
+                StopQueue(context, queueId);
+                return true;
+            }
         }
 
         private void GeneratePermutationQueueRatePlans(KeySysLambdaContext context, bool usesProration, BillingPeriod billingPeriod, long instanceId, long commPlanGroupId, RatePoolCollection ratePoolCollection, DataTable commGroupRatePlanTable)
