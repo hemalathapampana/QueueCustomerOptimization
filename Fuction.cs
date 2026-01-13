@@ -691,26 +691,33 @@ namespace Altaworx.SimCard.Cost.QueueCustomerOptimization
 
             try
             {
-                // Evaluate strategies (smallest->largest, largest->smallest, comm variants)
-                var selection = AutoRatePlanHelper.EvaluateBestStrategy(groupRatePlans, optimizationSimCards, chargeType);
+                // Evaluate 4 strategies and pick best (minimal total cost)
+                var s1 = AutoRatePlanHelper.EvaluateSmallestToLargest(groupRatePlans, optimizationSimCards, chargeType);
+                var s2 = AutoRatePlanHelper.EvaluateLargestToSmallest(groupRatePlans, optimizationSimCards, chargeType);
+                var s3 = AutoRatePlanHelper.EvaluateCommSmallestToLargest(groupRatePlans, optimizationSimCards, chargeType);
+                var s4 = AutoRatePlanHelper.EvaluateCommLargestToSmallest(groupRatePlans, optimizationSimCards, chargeType);
 
-                foreach (var r in selection.AllResults.OrderBy(x => x.TotalCost))
+                var best = new[] { s1, s2, s3, s4 }.OrderBy(x => x.TotalCost).First();
+
+                foreach (var r in new[] { s1, s2, s3, s4 }.OrderBy(x => x.TotalCost))
                 {
-                    LogInfo(context, LogTypeConstant.Info, $"[AUTO] Strategy={r.Strategy}, TotalCost={r.TotalCost}");
+                    LogInfo(context, LogTypeConstant.Info,
+                        $"[AUTO] Strategy={r.Strategy}, TotalCost={r.TotalCost}, UsedMB={r.UsedWithinAllocationMBTotal}, UnusedMB={r.UnusedMBTotal}, ExcessMB={r.ExcessMBTotal}");
                 }
 
-                LogInfo(context, LogTypeConstant.Info, $"[AUTO] SelectedStrategy={selection.Best.Strategy}, TotalCost={selection.Best.TotalCost}");
+                LogInfo(context, LogTypeConstant.Info,
+                    $"[AUTO] SelectedStrategy={best.Strategy}, TotalCost={best.TotalCost}, UsedMB={best.UsedWithinAllocationMBTotal}, UnusedMB={best.UnusedMBTotal}, ExcessMB={best.ExcessMBTotal}");
 
                 // Apply the chosen device assignments back onto the sim cards (reflection-based)
-                AutoRatePlanHelper.ApplyAssignmentsToSimCards(selection.Best, groupRatePlans);
+                AutoRatePlanHelper.ApplyAssignmentsToSimCards(best, groupRatePlans);
 
                 // Persist results for this queue
                 var simsProjected = ProjectDataUsageAndSaveDevices(context, instanceId, optimizationSimCards, billingPeriod, false);
                 OptimizationResultDbWriter.RecordRatePool(context, context.ConnectionString, queueId, billingPeriod.Id, simsProjected);
-                OptimizationResultDbWriter.RecordTotalCost(context, context.ConnectionString, queueId, selection.Best.TotalCost);
+                OptimizationResultDbWriter.RecordTotalCost(context, context.ConnectionString, queueId, best.TotalCost);
 
                 // Log a sample of device assignments (to avoid huge logs)
-                foreach (var a in selection.Best.Assignments.Take(50))
+                foreach (var a in best.Assignments.Take(50))
                 {
                     LogInfo(
                         context,
@@ -719,9 +726,9 @@ namespace Altaworx.SimCard.Cost.QueueCustomerOptimization
                         $"AllocatedMB={a.AllocatedPlanMB}, Base={a.BaseCharge}, Overage={a.OverageCharge}, Total={a.TotalCharge}");
                 }
 
-                if (selection.Best.Assignments.Count > 50)
+                if (best.Assignments.Count > 50)
                 {
-                    LogInfo(context, LogTypeConstant.Info, $"[AUTO] Logged 50/{selection.Best.Assignments.Count} device assignments (sample).");
+                    LogInfo(context, LogTypeConstant.Info, $"[AUTO] Logged 50/{best.Assignments.Count} device assignments (sample).");
                 }
 
                 StopQueue(context, queueId);

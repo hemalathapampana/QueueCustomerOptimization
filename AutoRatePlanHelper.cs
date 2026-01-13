@@ -94,6 +94,40 @@ namespace Altaworx.SimCard.Cost.Optimizer.Core.Helpers
             /// PlanUsage -> AssignedPlanId
             /// </summary>
             public IReadOnlyDictionary<int, int> PlanAssignmentMap { get; init; }
+
+            /// <summary>
+            /// Sum over assigned plans: min(totalUsage, includedMB).
+            /// includedMB = AllocatedPlanMBPerDevice * DeviceCountAssignedToThatPlan
+            /// </summary>
+            public decimal UsedWithinAllocationMBTotal { get; init; }
+
+            /// <summary>
+            /// Sum over assigned plans: max(0, includedMB - totalUsage).
+            /// </summary>
+            public decimal UnusedMBTotal { get; init; }
+
+            /// <summary>
+            /// Sum over assigned plans: max(0, totalUsage - includedMB).
+            /// </summary>
+            public decimal ExcessMBTotal { get; init; }
+
+            public IReadOnlyList<PlanTotals> PlanTotals { get; init; }
+        }
+
+        public sealed class PlanTotals
+        {
+            public int RatePlanId { get; init; }
+            public string RatePlanCode { get; init; }
+            public string RatePlanName { get; init; }
+
+            public int DeviceCount { get; init; }
+            public decimal AllocatedPlanMBPerDevice { get; init; }
+            public decimal IncludedMBTotal { get; init; }
+
+            public decimal TotalUsageMB { get; init; }
+            public decimal UsedWithinAllocationMB { get; init; }
+            public decimal UnusedMB { get; init; }
+            public decimal ExcessMB { get; init; }
         }
 
         public sealed class BestStrategySelection
@@ -141,6 +175,68 @@ namespace Altaworx.SimCard.Cost.Optimizer.Core.Helpers
                 Best = best,
                 AllResults = results
             };
+        }
+
+        // ----------------------------
+        // 4 explicit strategy functions
+        // ----------------------------
+
+        public static StrategyResult EvaluateSmallestToLargest(
+            IEnumerable<RatePlan> ratePlans,
+            IEnumerable<vwOptimizationSimCard> simCards,
+            OptimizationChargeType chargeType)
+        {
+            return EvaluateSingle(ratePlans, simCards, chargeType, AutoAssignmentStrategy.SmallestToLargest);
+        }
+
+        public static StrategyResult EvaluateLargestToSmallest(
+            IEnumerable<RatePlan> ratePlans,
+            IEnumerable<vwOptimizationSimCard> simCards,
+            OptimizationChargeType chargeType)
+        {
+            return EvaluateSingle(ratePlans, simCards, chargeType, AutoAssignmentStrategy.LargestToSmallest);
+        }
+
+        public static StrategyResult EvaluateCommSmallestToLargest(
+            IEnumerable<RatePlan> ratePlans,
+            IEnumerable<vwOptimizationSimCard> simCards,
+            OptimizationChargeType chargeType)
+        {
+            return EvaluateSingle(ratePlans, simCards, chargeType, AutoAssignmentStrategy.CommSmallestToLargest);
+        }
+
+        public static StrategyResult EvaluateCommLargestToSmallest(
+            IEnumerable<RatePlan> ratePlans,
+            IEnumerable<vwOptimizationSimCard> simCards,
+            OptimizationChargeType chargeType)
+        {
+            return EvaluateSingle(ratePlans, simCards, chargeType, AutoAssignmentStrategy.CommLargestToSmallest);
+        }
+
+        public static StrategyResult PickBestOfFour(
+            IEnumerable<RatePlan> ratePlans,
+            IEnumerable<vwOptimizationSimCard> simCards,
+            OptimizationChargeType chargeType)
+        {
+            var r1 = EvaluateSmallestToLargest(ratePlans, simCards, chargeType);
+            var r2 = EvaluateLargestToSmallest(ratePlans, simCards, chargeType);
+            var r3 = EvaluateCommSmallestToLargest(ratePlans, simCards, chargeType);
+            var r4 = EvaluateCommLargestToSmallest(ratePlans, simCards, chargeType);
+
+            return new[] { r1, r2, r3, r4 }.OrderBy(r => r.TotalCost).First();
+        }
+
+        private static StrategyResult EvaluateSingle(
+            IEnumerable<RatePlan> ratePlans,
+            IEnumerable<vwOptimizationSimCard> simCards,
+            OptimizationChargeType chargeType,
+            AutoAssignmentStrategy strategy)
+        {
+            var planCatalog = BuildRatePlanCatalog(ratePlans).ToList();
+            var simUsages = BuildSimUsages(simCards, planCatalog).ToList();
+            planCatalog = HydratePlanAllocationsFromSimCards(planCatalog, simUsages);
+            var planUsage = BuildRatePlanUsage(planCatalog, simUsages).ToList();
+            return EvaluateStrategy(strategy, planCatalog, simUsages, planUsage, chargeType);
         }
 
         /// <summary>
@@ -265,14 +361,58 @@ namespace Altaworx.SimCard.Cost.Optimizer.Core.Helpers
                 });
             }
 
+            var planTotals = BuildPlanTotals(planCatalog, assignments);
+
             return new StrategyResult
             {
                 Strategy = strategy,
                 TotalCost = assignments.Sum(a => a.TotalCharge),
                 Assignments = assignments,
                 OriginalPlanUsages = originalPlanUsage,
-                PlanAssignmentMap = planAssignment
+                PlanAssignmentMap = planAssignment,
+                UsedWithinAllocationMBTotal = planTotals.Sum(t => t.UsedWithinAllocationMB),
+                UnusedMBTotal = planTotals.Sum(t => t.UnusedMB),
+                ExcessMBTotal = planTotals.Sum(t => t.ExcessMB),
+                PlanTotals = planTotals
             };
+        }
+
+        private static List<PlanTotals> BuildPlanTotals(
+            IReadOnlyList<RatePlanCatalogItem> planCatalog,
+            IReadOnlyList<SimAssignment> assignments)
+        {
+            var planById = planCatalog.ToDictionary(p => p.RatePlanId, p => p);
+
+            // Only consider plans that actually received devices (so UnusedMB reflects "unused within used plans").
+            // If you want "unused plans" too, compute that outside by checking plan ids not present here.
+            return assignments
+                .GroupBy(a => a.AssignedRatePlanId)
+                .Select(g =>
+                {
+                    var plan = planById[g.Key];
+                    var deviceCount = g.Count();
+                    var totalUsage = g.Sum(x => x.UsageMB);
+                    var includedTotal = plan.AllocatedPlanMB * deviceCount;
+                    var used = Math.Min(totalUsage, includedTotal);
+                    var unused = Math.Max(0m, includedTotal - totalUsage);
+                    var excess = Math.Max(0m, totalUsage - includedTotal);
+
+                    return new PlanTotals
+                    {
+                        RatePlanId = plan.RatePlanId,
+                        RatePlanCode = plan.RatePlanCode,
+                        RatePlanName = plan.RatePlanName,
+                        DeviceCount = deviceCount,
+                        AllocatedPlanMBPerDevice = plan.AllocatedPlanMB,
+                        IncludedMBTotal = includedTotal,
+                        TotalUsageMB = totalUsage,
+                        UsedWithinAllocationMB = used,
+                        UnusedMB = unused,
+                        ExcessMB = excess
+                    };
+                })
+                .OrderBy(t => t.AllocatedPlanMBPerDevice)
+                .ToList();
         }
 
         private static IReadOnlyDictionary<int, int> BuildAssignmentMap_SmallestToLargest(
